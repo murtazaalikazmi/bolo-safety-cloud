@@ -1,7 +1,7 @@
 """
 Bolo Safety Cloud — Processing Pipeline
-Reads audio from Supabase Storage → Whisper → GPT → Supabase DB
-Called internally by app.py when an admin presses the process button.
+Reads audio from Dropbox → Whisper → GPT → Supabase DB
+Called from app.py when an admin presses the Process button.
 """
 
 import os
@@ -14,7 +14,7 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────────
 # LIMITS
 # ─────────────────────────────────────────────────────────────
-MAX_DURATION_SECONDS = 300   # 5 minutes
+MAX_DURATION_SECONDS = 300    # 5 minutes
 MAX_FILE_SIZE_MB     = 20
 AUDIO_EXTENSIONS     = {".wav", ".m4a", ".mp3", ".ogg", ".flac", ".aac", ".wma", ".mp4"}
 
@@ -42,32 +42,65 @@ Respond with valid JSON only:
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPERS
+# DROPBOX HELPERS
 # ─────────────────────────────────────────────────────────────
-def normalize_domain_terms(text):
-    for wrong, correct in DOMAIN_TERMS.items():
-        text = re.sub(rf"\b{re.escape(wrong)}\b", correct, text, flags=re.I)
-    return text
+def get_dropbox_client(app_key, app_secret, refresh_token):
+    import dropbox
+    # Uses refresh token — auto-renews access, never expires
+    return dropbox.Dropbox(
+        app_key=app_key,
+        app_secret=app_secret,
+        oauth2_refresh_token=refresh_token
+    )
 
 
+def list_dropbox_audio(dbx, folder_path):
+    """Return list of audio file metadata dicts from the Dropbox folder."""
+    import dropbox
+    try:
+        result = dbx.files_list_folder(folder_path)
+        files  = []
+        while True:
+            for entry in result.entries:
+                if isinstance(entry, dropbox.files.FileMetadata):
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in AUDIO_EXTENSIONS:
+                        files.append({
+                            "name":          entry.name,
+                            "path":          entry.path_lower,
+                            "size_bytes":    entry.size,
+                            "server_modified": str(entry.server_modified),
+                        })
+            if not result.has_more:
+                break
+            result = dbx.files_list_folder_continue(result.cursor)
+        return files
+    except Exception as e:
+        raise RuntimeError(f"Could not list Dropbox folder '{folder_path}': {e}")
+
+
+def download_from_dropbox(dbx, dropbox_path):
+    """Download a file from Dropbox and return its bytes."""
+    _, response = dbx.files_download(dropbox_path)
+    return response.content
+
+
+# ─────────────────────────────────────────────────────────────
+# AUDIO HELPERS
+# ─────────────────────────────────────────────────────────────
 def check_limits(file_bytes, filename):
-    """
-    Returns (ok: bool, reason: str).
-    Checks file size first (fast), then audio duration.
-    """
+    """Returns (ok: bool, reason: str). Checks size then duration."""
     size_mb = len(file_bytes) / (1024 * 1024)
     if size_mb > MAX_FILE_SIZE_MB:
         return False, f"File too large: {size_mb:.1f} MB (max {MAX_FILE_SIZE_MB} MB)"
 
-    # Write to temp file to check duration
     ext = os.path.splitext(filename)[1].lower() or ".wav"
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
         f.write(file_bytes)
         tmp = f.name
     try:
         from pydub import AudioSegment
-        audio    = AudioSegment.from_file(tmp)
-        duration = len(audio) / 1000   # ms → seconds
+        duration = len(AudioSegment.from_file(tmp)) / 1000
         if duration > MAX_DURATION_SECONDS:
             return False, (
                 f"Recording too long: {duration/60:.1f} min "
@@ -80,7 +113,7 @@ def check_limits(file_bytes, filename):
 
 
 def preprocess_audio(file_bytes, filename):
-    """Normalise volume and return path to a temp WAV file."""
+    """Normalise volume, return path to a temp WAV file."""
     from pydub import AudioSegment
     from pydub.effects import normalize as pydub_normalize
 
@@ -88,7 +121,6 @@ def preprocess_audio(file_bytes, filename):
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
         f.write(file_bytes)
         src = f.name
-
     try:
         audio = pydub_normalize(AudioSegment.from_file(src))
     finally:
@@ -100,8 +132,17 @@ def preprocess_audio(file_bytes, filename):
     return wav_path
 
 
+# ─────────────────────────────────────────────────────────────
+# WHISPER
+# ─────────────────────────────────────────────────────────────
+def normalize_domain_terms(text):
+    for wrong, correct in DOMAIN_TERMS.items():
+        text = re.sub(rf"\b{re.escape(wrong)}\b", correct, text, flags=re.I)
+    return text
+
+
 def transcribe_and_translate(wav_path, whisper_model):
-    args = dict(language="ur", temperature=0.0, fp16=False)
+    args         = dict(language="ur", temperature=0.0, fp16=False)
     urdu_text    = whisper_model.transcribe(wav_path, task="transcribe", **args).get("text", "").strip()
     english_text = normalize_domain_terms(
         whisper_model.transcribe(wav_path, task="translate", **args).get("text", "").strip()
@@ -109,6 +150,9 @@ def transcribe_and_translate(wav_path, whisper_model):
     return urdu_text, english_text
 
 
+# ─────────────────────────────────────────────────────────────
+# GPT HELPERS
+# ─────────────────────────────────────────────────────────────
 def extract_reporter_name(urdu_text, openai_client):
     if not urdu_text:
         return "Not available"
@@ -159,17 +203,18 @@ def extract_time_from_filename(filename):
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN PIPELINE FUNCTION
-# Called from app.py with a Streamlit UI container for live logging
+# MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────
 def run_pipeline(ui, supabase_client, whisper_model, openai_client,
-                 bucket_name="voice-notes"):
+                 dropbox_app_key, dropbox_app_secret, dropbox_refresh_token,
+                 dropbox_folder):
     """
-    ui             — Streamlit container for live log output
-    supabase_client — initialised supabase-py Client
-    whisper_model   — loaded whisper model (cached in app.py)
-    openai_client   — OpenAI client (cached in app.py)
-    bucket_name     — Supabase Storage bucket name
+    ui              — Streamlit container for live log output
+    supabase_client — initialised supabase-py Client (for DB only)
+    whisper_model   — loaded Whisper model
+    openai_client   — OpenAI client
+    dropbox_token   — Dropbox access token
+    dropbox_folder  — Dropbox folder path e.g. '/ASR Recordings'
     """
 
     def log(msg, kind="write"):
@@ -183,21 +228,18 @@ def run_pipeline(ui, supabase_client, whisper_model, openai_client,
     print("\n" + "="*60)
     print("PIPELINE STARTED")
 
-    # ── 1. Fetch list of files in storage bucket ──────────────
+    # ── 1. Connect to Dropbox & list files ───────────────────
     try:
-        all_storage = supabase_client.storage.from_(bucket_name).list()
-        audio_files = [
-            f for f in all_storage
-            if os.path.splitext(f["name"])[1].lower() in AUDIO_EXTENSIONS
-        ]
+        dbx         = get_dropbox_client(dropbox_app_key, dropbox_app_secret, dropbox_refresh_token)
+        audio_files = list_dropbox_audio(dbx, dropbox_folder)
     except Exception as e:
-        log(f"❌ Could not list storage bucket `{bucket_name}`: {e}", "error")
+        log(f"❌ Dropbox error: {e}", "error")
         return 0
 
-    log(f"📂 Storage bucket: **{bucket_name}**")
+    log(f"📂 Dropbox folder: **{dropbox_folder}**")
     log(f"   Audio files found: **{len(audio_files)}**")
 
-    # ── 2. Find already-processed filenames from DB ───────────
+    # ── 2. Find already-processed filenames from Supabase DB ─
     try:
         processed_resp = supabase_client.table("processed_files").select("filename").execute()
         processed      = {row["filename"] for row in processed_resp.data}
@@ -223,21 +265,20 @@ def run_pipeline(ui, supabase_client, whisper_model, openai_client,
 
         wav_path = None
         try:
-            # ── Download from Supabase Storage ────────────────
-            log("  ⏳ Downloading from cloud…")
-            file_bytes = supabase_client.storage.from_(bucket_name).download(filename)
+            # ── Download from Dropbox ─────────────────────────
+            log("  ⏳ Downloading from Dropbox…")
+            file_bytes = download_from_dropbox(dbx, file_meta["path"])
 
             # ── Enforce limits ────────────────────────────────
             ok, reason = check_limits(file_bytes, filename)
             if not ok:
                 log(f"  ⛔ Skipped — {reason}", "warn")
-                # Mark as processed so it's not retried every time
                 supabase_client.table("processed_files").insert(
                     {"filename": filename, "skipped": True, "reason": reason}
                 ).execute()
                 continue
 
-            # ── Pre-process audio ─────────────────────────────
+            # ── Pre-process ───────────────────────────────────
             log("  ⏳ Converting audio…")
             wav_path = preprocess_audio(file_bytes, filename)
 
@@ -256,7 +297,7 @@ def run_pipeline(ui, supabase_client, whisper_model, openai_client,
             log(f"  ✅ **{cat['category']}** | Severity: {cat['severity']} "
                 f"| Location: {cat['location']} | Reporter: {name}")
 
-            # ── Save observation to DB ────────────────────────
+            # ── Save to Supabase DB ───────────────────────────
             supabase_client.table("observations").insert({
                 "time_of_reporting":   report_time,
                 "name":                name,
@@ -269,7 +310,6 @@ def run_pipeline(ui, supabase_client, whisper_model, openai_client,
                 "audio_file":          filename,
             }).execute()
 
-            # ── Mark as processed ─────────────────────────────
             supabase_client.table("processed_files").insert(
                 {"filename": filename, "skipped": False, "reason": ""}
             ).execute()
