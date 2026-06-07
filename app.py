@@ -1,3 +1,4 @@
+"""
 Bolo Safety Cloud — Main Application
 Run locally:  streamlit run app.py
 Deploy:       Streamlit Community Cloud (connect GitHub repo)
@@ -419,4 +420,3 @@ if st.session_state.role is None:
     show_login()
 else:
     show_dashboard()
-
