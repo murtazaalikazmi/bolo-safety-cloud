@@ -1,20 +1,22 @@
-"""
 Bolo Safety Cloud — Main Application
 Run locally:  streamlit run app.py
 Deploy:       Streamlit Community Cloud (connect GitHub repo)
+
+Architecture:
+  Phone (ASR app) → Cloud Storage (Supabase bucket)
+  Admin presses ⚡ Process → Whisper + GPT → Supabase DB
+  Admin: full dashboard + process button
+  Viewer: dashboard only
 """
 
-import os
-import io
-import tempfile
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 from datetime import datetime
-from pipeline import run_pipeline, MAX_DURATION_SECONDS, MAX_FILE_SIZE_MB, AUDIO_EXTENSIONS
+from pipeline import run_pipeline
 
 # ─────────────────────────────────────────────────────────────
-# PAGE CONFIG  (must be first Streamlit call)
+# PAGE CONFIG
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Bolo Safety",
@@ -24,17 +26,20 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────
-# SECRETS  (set in .streamlit/secrets.toml or Streamlit Cloud)
+# SECRETS  (.streamlit/secrets.toml locally, or Streamlit Cloud settings)
 # ─────────────────────────────────────────────────────────────
-SUPABASE_URL    = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY    = st.secrets["SUPABASE_KEY"]
-OPENAI_API_KEY  = st.secrets["OPENAI_API_KEY"]
-ADMIN_PASSWORD  = st.secrets["ADMIN_PASSWORD"]
-VIEWER_PASSWORD = st.secrets["VIEWER_PASSWORD"]
-BUCKET_NAME     = st.secrets.get("BUCKET_NAME", "voice-notes")
+SUPABASE_URL     = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY     = st.secrets["SUPABASE_KEY"]
+OPENAI_API_KEY   = st.secrets["OPENAI_API_KEY"]
+ADMIN_PASSWORD   = st.secrets["ADMIN_PASSWORD"]
+VIEWER_PASSWORD  = st.secrets["VIEWER_PASSWORD"]
+DROPBOX_APP_KEY       = st.secrets["DROPBOX_APP_KEY"]
+DROPBOX_APP_SECRET    = st.secrets["DROPBOX_APP_SECRET"]
+DROPBOX_REFRESH_TOKEN = st.secrets["DROPBOX_REFRESH_TOKEN"]
+DROPBOX_FOLDER        = st.secrets.get("DROPBOX_FOLDER", "/ASR Recordings")
 
 # ─────────────────────────────────────────────────────────────
-# CACHED RESOURCES  (loaded once per server session)
+# CACHED RESOURCES  (loaded once, reused across reruns)
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_supabase():
@@ -50,6 +55,15 @@ def get_whisper():
 def get_openai():
     from openai import OpenAI
     return OpenAI(api_key=OPENAI_API_KEY)
+
+@st.cache_resource
+def get_dropbox():
+    import dropbox
+    return dropbox.Dropbox(
+        app_key=DROPBOX_APP_KEY,
+        app_secret=DROPBOX_APP_SECRET,
+        oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+    )
 
 # ─────────────────────────────────────────────────────────────
 # SESSION STATE INIT
@@ -87,96 +101,18 @@ def show_login():
     with col_m:
         st.image("https://img.icons8.com/color/96/hard-hat.png", width=80)
         st.title("🦺 Bolo Safety")
-        st.caption("HSE Observation Intelligence Platform")
+        st.caption("HSE Observation Intelligence Platform · Engro Corporation")
         st.divider()
-
-        tab_login, tab_upload = st.tabs(["🔐 Staff Login", "🎙️ Submit a Voice Note"])
-
-        # ── Authenticated login ───────────────────────────────
-        with tab_login:
-            pwd = st.text_input("Enter your password", type="password", key="login_pwd")
-            if st.button("Login", type="primary", use_container_width=True):
-                if pwd == ADMIN_PASSWORD:
-                    st.session_state.role = "admin"
-                    st.rerun()
-                elif pwd == VIEWER_PASSWORD:
-                    st.session_state.role = "viewer"
-                    st.rerun()
-                else:
-                    st.error("Incorrect password. Please try again.")
-            st.caption("Contact your HSE officer if you need access.")
-
-        # ── Public upload (no login needed) ──────────────────
-        with tab_upload:
-            show_upload_form()
-
-
-# ─────────────────────────────────────────────────────────────
-# UPLOAD FORM  (accessible without login — workers use this)
-# ─────────────────────────────────────────────────────────────
-def show_upload_form():
-    st.markdown(
-        f"Upload a voice note of your safety observation.  \n"
-        f"**Max length:** {MAX_DURATION_SECONDS // 60} minutes  |  "
-        f"**Max size:** {MAX_FILE_SIZE_MB} MB"
-    )
-
-    uploaded = st.file_uploader(
-        "Choose audio file",
-        type=["wav", "m4a", "mp3", "ogg", "flac", "aac"],
-        key="upload_widget",
-    )
-
-    if uploaded:
-        file_bytes = uploaded.read()
-        size_mb    = len(file_bytes) / (1024 * 1024)
-
-        # ── Client-side size check ────────────────────────────
-        if size_mb > MAX_FILE_SIZE_MB:
-            st.error(
-                f"⛔ File is {size_mb:.1f} MB — exceeds the {MAX_FILE_SIZE_MB} MB limit. "
-                "Please trim the recording and try again."
-            )
-            return
-
-        # ── Duration check ────────────────────────────────────
-        st.info("⏳ Checking recording length…")
-        ext = os.path.splitext(uploaded.name)[1].lower() or ".wav"
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-            f.write(file_bytes)
-            tmp = f.name
-        try:
-            from pydub import AudioSegment
-            duration = len(AudioSegment.from_file(tmp)) / 1000
-        finally:
-            os.remove(tmp)
-
-        if duration > MAX_DURATION_SECONDS:
-            st.error(
-                f"⛔ Recording is {duration/60:.1f} min — exceeds the "
-                f"{MAX_DURATION_SECONDS//60}-minute limit. "
-                "Please keep observations concise and re-record."
-            )
-            return
-
-        # ── Upload to Supabase Storage ────────────────────────
-        st.info("⏳ Uploading to secure cloud storage…")
-        try:
-            timestamp   = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-            remote_name = f"{timestamp}_{uploaded.name}"
-            supabase    = get_supabase()
-            supabase.storage.from_(BUCKET_NAME).upload(
-                path=remote_name,
-                file=file_bytes,
-                file_options={"content-type": uploaded.type or "audio/wav"},
-            )
-            st.success(
-                f"✅ Voice note uploaded successfully!  \n"
-                f"Your observation has been received and will be processed shortly."
-            )
-        except Exception as e:
-            st.error(f"❌ Upload failed: {e}")
-
+        pwd = st.text_input("Enter your password", type="password")
+        if st.button("Login", type="primary", use_container_width=True):
+            if pwd == ADMIN_PASSWORD:
+                st.session_state.role = "admin"
+                st.rerun()
+            elif pwd == VIEWER_PASSWORD:
+                st.session_state.role = "viewer"
+                st.rerun()
+            else:
+                st.error("Incorrect password. Please contact your HSE officer.")
 
 # ─────────────────────────────────────────────────────────────
 # DATA LOADING FROM SUPABASE DB
@@ -184,8 +120,9 @@ def show_upload_form():
 @st.cache_data(ttl=30)
 def load_observations():
     try:
-        supabase = get_supabase()
-        resp     = supabase.table("observations").select("*").order("time_of_reporting", desc=False).execute()
+        resp = get_supabase().table("observations").select("*").order(
+            "time_of_reporting", desc=False
+        ).execute()
         if not resp.data:
             return pd.DataFrame()
         df = pd.DataFrame(resp.data)
@@ -208,14 +145,14 @@ def load_observations():
                 df[col] = "Not specified"
         return df
     except Exception as e:
-        st.error(f"Failed to load data from database: {e}")
+        st.error(f"Failed to load data: {e}")
         return pd.DataFrame()
-
 
 # ─────────────────────────────────────────────────────────────
 # MAIN DASHBOARD
 # ─────────────────────────────────────────────────────────────
 def show_dashboard():
+
     # ── SIDEBAR ──────────────────────────────────────────────
     with st.sidebar:
         st.title("🦺 Bolo Safety")
@@ -232,16 +169,11 @@ def show_dashboard():
                 st.session_state.pipeline_done     = False
                 st.rerun()
 
-            if st.button("🗑️ Clear log", use_container_width=True):
-                st.session_state.pipeline_log  = []
-                st.session_state.pipeline_done = False
-                st.rerun()
-
-            st.divider()
-
-            # Upload section for admins too
-            with st.expander("🎙️ Upload a voice note"):
-                show_upload_form()
+            if st.session_state.pipeline_log:
+                if st.button("🗑️ Clear log", use_container_width=True):
+                    st.session_state.pipeline_log  = []
+                    st.session_state.pipeline_done = False
+                    st.rerun()
 
             st.divider()
 
@@ -249,10 +181,12 @@ def show_dashboard():
         df_raw = load_observations()
 
         if df_raw.empty:
-            st.warning("No observations yet.")
             if st.session_state.role == "admin":
-                st.info("Upload a voice note and press ⚡ Process & Refresh.")
-            if st.button("🔓 Logout"):
+                st.info("No observations yet. Once voice notes are uploaded to the cloud bucket, press ⚡ Process & Refresh.")
+            else:
+                st.info("No observations available yet.")
+            st.divider()
+            if st.button("🔓 Logout", use_container_width=True):
                 st.session_state.role = None
                 st.rerun()
             st.stop()
@@ -305,11 +239,14 @@ def show_dashboard():
             st.session_state.run_pipeline_flag = False
             with st.expander("📋 Processing Log", expanded=True):
                 run_pipeline(
-                    ui            = st,
-                    supabase_client = get_supabase(),
-                    whisper_model = get_whisper(),
-                    openai_client = get_openai(),
-                    bucket_name   = BUCKET_NAME,
+                    ui                    = st,
+                    supabase_client       = get_supabase(),
+                    whisper_model         = get_whisper(),
+                    openai_client         = get_openai(),
+                    dropbox_app_key       = DROPBOX_APP_KEY,
+                    dropbox_app_secret    = DROPBOX_APP_SECRET,
+                    dropbox_refresh_token = DROPBOX_REFRESH_TOKEN,
+                    dropbox_folder        = DROPBOX_FOLDER,
                 )
                 st.session_state.pipeline_done = True
             st.cache_data.clear()
@@ -482,3 +419,4 @@ if st.session_state.role is None:
     show_login()
 else:
     show_dashboard()
+
